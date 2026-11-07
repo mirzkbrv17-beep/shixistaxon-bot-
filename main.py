@@ -32,7 +32,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    FSInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     KeyboardButton,
     Message,
@@ -88,11 +90,29 @@ async def init_db():
                 invited_by INTEGER, joined_at INTEGER,
                 PRIMARY KEY(contest_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS links(
+                link TEXT PRIMARY KEY, contest_id INTEGER, user_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS invites(
+                contest_id INTEGER, inviter_id INTEGER, invited_id INTEGER,
+                invited_name TEXT, active INTEGER DEFAULT 1, joined_at INTEGER,
+                PRIMARY KEY(contest_id, invited_id)
+            );
+            CREATE TABLE IF NOT EXISTS bonus(
+                contest_id INTEGER, user_id INTEGER, value INTEGER DEFAULT 0,
+                PRIMARY KEY(contest_id, user_id)
+            );
             CREATE TABLE IF NOT EXISTS winners(
                 contest_id INTEGER, user_id INTEGER,
                 PRIMARY KEY(contest_id, user_id)
             );
             """
+        )
+        # Eski usul (bot orqali taklif) natijalarini yangi hisobga ko'chirish — natijalar yo'qolmaydi
+        await db.execute(
+            "INSERT OR IGNORE INTO invites(contest_id,inviter_id,invited_id,invited_name,active,joined_at) "
+            "SELECT contest_id, invited_by, user_id, full_name, 1, joined_at "
+            "FROM participants WHERE invited_by IS NOT NULL"
         )
         await db.commit()
 
@@ -253,45 +273,40 @@ async def attempt_join(user, cid, ref, chat_id):
             reply_markup=kb.as_markup(),
         )
 
-    valid_ref = None
-    if c["mode"] == "referral" and ref and ref != user.id:
-        if await q_one("SELECT 1 FROM participants WHERE contest_id=? AND user_id=?", (cid, ref)):
-            valid_ref = ref
-
-    cur = await q_exec(
+    await q_exec(
         "INSERT OR IGNORE INTO participants(contest_id,user_id,username,full_name,invited_by,joined_at) "
         "VALUES(?,?,?,?,?,?)",
-        (cid, user.id, user.username, user.full_name, valid_ref, int(time.time())),
+        (cid, user.id, user.username, user.full_name, None, int(time.time())),
     )
-    is_new = cur.rowcount > 0
-
-    if is_new and valid_ref:
-        n = (await q_one("SELECT COUNT(*) n FROM participants WHERE contest_id=? AND invited_by=?", (cid, valid_ref)))["n"]
-        try:
-            await bot.send_message(
-                valid_ref,
-                f"🎉 Sizning havolangiz orqali {mention(user.id, user.full_name)} qo'shildi!\n"
-                f"Jami takliflaringiz: <b>{n}</b>",
-            )
-        except Exception:
-            pass
 
     text = f"✅ <b>Siz konkursda qatnashyapsiz!</b>\n🎁 {html.escape(c['title'])}\n"
-    kb = InlineKeyboardBuilder()
     if c["mode"] == "referral":
-        link = await contest_link(cid, user.id)
+        try:
+            link = await get_user_link(c, user.id)
+        except Exception as e:
+            log.warning("Invite link yaratilmadi: %s", e)
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    "⚠️ Shaxsiy kanal havolasi yaratilmadi. Botni e'lon kanalida admin qiling va "
+                    "«Havola orqali foydalanuvchilarni taklif qilish» huquqini bering.")
+            except Exception:
+                pass
+            return await bot.send_message(chat_id, "⚠️ Havola yaratib bo'lmadi. Admin bilan bog'laning.")
         text += (
-            f"\n🔗 <b>Sizning havolangiz:</b>\n{link}\n\n"
-            "Do'stlaringizga yuboring — eng ko'p odam taklif qilgan g'olib bo'ladi!"
+            f"\n🔗 <b>Sizning shaxsiy KANAL havolangiz:</b>\n{link}\n\n"
+            "Shu havolani do'stlaringizga yuboring. Ular havola orqali <b>kanalga qo'shilsa</b> "
+            "sizga hisoblanadi. Eng ko'p odam qo'shgan g'olib bo'ladi!"
         )
+        kb = InlineKeyboardBuilder()
         kb.row(
             InlineKeyboardButton(text="📊 Mening natijam", callback_data=f"me:{cid}"),
             InlineKeyboardButton(text="🏆 Reyting", callback_data=f"top:{cid}"),
         )
-    else:
-        text += "\nOmad tilaymiz! 🍀"
-    await bot.send_message(chat_id, text, reply_markup=kb.as_markup() if c["mode"] == "referral" else None,
-                           disable_web_page_preview=True)
+        await bot.send_message(chat_id, text, reply_markup=kb.as_markup(), disable_web_page_preview=True)
+        return
+    text += "\nOmad tilaymiz! 🍀"
+    await bot.send_message(chat_id, text)
 
 
 @user_r.callback_query(F.data.startswith("chk:"))
@@ -301,11 +316,59 @@ async def cb_check(cb: CallbackQuery):
     await attempt_join(cb.from_user, int(cid), int(ref) or None, cb.message.chat.id)
 
 
+async def get_user_link(c, uid):
+    row = await q_one("SELECT link FROM links WHERE contest_id=? AND user_id=?", (c["id"], uid))
+    if row:
+        return row["link"]
+    ch = json.loads(c["channels"])[0]
+    inv = await bot.create_chat_invite_link(ch["id"], name=f"k{c['id']}-{uid}"[:32])
+    await q_exec("INSERT OR REPLACE INTO links VALUES(?,?,?)", (inv.invite_link, c["id"], uid))
+    return inv.invite_link
+
+
+async def still_in(user_id, chat_id) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("member", "administrator", "creator") or (
+            m.status == "restricted" and getattr(m, "is_member", False))
+    except Exception:
+        return True  # xatoda odamni jazolamaymiz
+
+
+async def get_scores(cid, verify=False):
+    c = await get_contest(cid)
+    main_id = json.loads(c["channels"])[0]["id"]
+    scores = {}
+    rows = await q_all("SELECT inviter_id, invited_id FROM invites WHERE contest_id=? AND active=1", (cid,))
+    for r in rows:
+        if verify:
+            ok = await still_in(r["invited_id"], main_id)
+            await asyncio.sleep(0.05)
+            if not ok:
+                await q_exec("UPDATE invites SET active=0 WHERE contest_id=? AND invited_id=?", (cid, r["invited_id"]))
+                continue
+        sc = scores.setdefault(r["inviter_id"], {"inv": 0, "bonus": 0})
+        sc["inv"] += 1
+    for r in await q_all("SELECT user_id, value FROM bonus WHERE contest_id=?", (cid,)):
+        sc = scores.setdefault(r["user_id"], {"inv": 0, "bonus": 0})
+        sc["bonus"] = r["value"]
+    return scores
+
+
+async def part_names(cid):
+    return {r["user_id"]: r["full_name"] for r in
+            await q_all("SELECT user_id, full_name FROM participants WHERE contest_id=?", (cid,))}
+
+
+def total(sc):
+    return sc["inv"] + sc["bonus"]
+
+
 @user_r.callback_query(F.data.startswith("me:"))
 async def cb_me(cb: CallbackQuery):
     cid = int(cb.data.split(":")[1])
-    n = (await q_one("SELECT COUNT(*) n FROM participants WHERE contest_id=? AND invited_by=?", (cid, cb.from_user.id)))["n"]
-    await cb.answer(f"Siz {n} ta odam taklif qildingiz", show_alert=True)
+    sc = (await get_scores(cid)).get(cb.from_user.id, {"inv": 0, "bonus": 0})
+    await cb.answer(f"Sizning natijangiz: {total(sc)} ta", show_alert=True)
 
 
 @user_r.callback_query(F.data.startswith("top:"))
@@ -316,20 +379,59 @@ async def cb_top(cb: CallbackQuery):
 
 
 async def top_text(cid, limit=10):
-    rows = await q_all(
-        "SELECT p.user_id, p.full_name, COUNT(i.user_id) cnt FROM participants p "
-        "JOIN participants i ON i.contest_id=p.contest_id AND i.invited_by=p.user_id "
-        "WHERE p.contest_id=? GROUP BY p.user_id ORDER BY cnt DESC LIMIT ?",
-        (cid, limit),
-    )
-    if not rows:
+    scores = await get_scores(cid)
+    ranked = sorted(scores.items(), key=lambda x: -total(x[1]))
+    ranked = [r for r in ranked if total(r[1]) > 0][:limit]
+    if not ranked:
         return "🏆 Hozircha reyting bo'sh."
+    names = await part_names(cid)
     medals = ["🥇", "🥈", "🥉"]
     lines = ["🏆 <b>Reyting (TOP 10)</b>\n"]
-    for i, r in enumerate(rows):
+    for i, (uid, sc) in enumerate(ranked):
         mk = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{mk} {html.escape(r['full_name'] or str(r['user_id']))} — <b>{r['cnt']}</b>")
+        lines.append(f"{mk} {html.escape(names.get(uid) or str(uid))} — <b>{total(sc)}</b>")
     return "\n".join(lines)
+
+
+@user_r.chat_member()
+async def on_chat_member(ev: ChatMemberUpdated):
+    old, new = ev.old_chat_member.status, ev.new_chat_member.status
+    user = ev.new_chat_member.user
+    if user.is_bot:
+        return
+    in_status = ("member", "administrator", "creator")
+    joined = new in in_status and old not in in_status
+    left = new in ("left", "kicked") and old in in_status
+    contests = await q_all("SELECT id, channels FROM contests WHERE status='active' AND mode='referral'")
+    for c in contests:
+        if json.loads(c["channels"])[0]["id"] != ev.chat.id:
+            continue
+        cid = c["id"]
+        if left:
+            await q_exec("UPDATE invites SET active=0 WHERE contest_id=? AND invited_id=?", (cid, user.id))
+            continue
+        if not (joined and ev.invite_link):
+            continue
+        row = await q_one("SELECT user_id FROM links WHERE link=? AND contest_id=?",
+                          (ev.invite_link.invite_link, cid))
+        if not row or row["user_id"] == user.id:
+            continue
+        inviter = row["user_id"]
+        ex = await q_one("SELECT inviter_id, active FROM invites WHERE contest_id=? AND invited_id=?", (cid, user.id))
+        if ex:
+            if not ex["active"] and ex["inviter_id"] == inviter:
+                await q_exec("UPDATE invites SET active=1 WHERE contest_id=? AND invited_id=?", (cid, user.id))
+            continue
+        await q_exec("INSERT OR IGNORE INTO invites VALUES(?,?,?,?,1,?)",
+                     (cid, inviter, user.id, user.full_name, int(time.time())))
+        sc = (await get_scores(cid)).get(inviter, {"inv": 0, "bonus": 0})
+        try:
+            await bot.send_message(
+                inviter,
+                f"🎉 Sizning havolangiz orqali {mention(user.id, user.full_name)} kanalga qo'shildi!\n"
+                f"Jami natijangiz: <b>{total(sc)}</b>")
+        except Exception:
+            pass
 
 
 # ───────────────────────── Admin: yaratish ─────────────────────────
@@ -452,6 +554,8 @@ async def st_ends(m: Message, state: FSMContext):
     )
     if extra:
         text += "📌 Shart: " + ", ".join(html.escape(c["title"]) for c in extra) + " kanallariga a'zo bo'lish\n"
+    if d["mode"] == "referral":
+        text += "👥 Kanalga eng ko'p odam qo'shgan g'olib bo'ladi (shaxsiy havola botdan olinadi)\n"
     if ends:
         text += f"⏰ Tugash: <b>{fmt_ts(ends)}</b>\n"
     text += "\n👇 Qatnashish uchun tugmani bosing"
@@ -499,7 +603,7 @@ async def detail(cid):
         if c["mode"] == "manual":
             kb.row(InlineKeyboardButton(text="👥 Qatnashchilardan g'olib tanlash", callback_data=f"pl:{cid}:0"))
         if c["mode"] == "referral":
-            kb.row(InlineKeyboardButton(text="🏆 Reyting", callback_data=f"atop:{cid}"))
+            kb.row(InlineKeyboardButton(text="🏆 Reyting / ballni o'zgartirish", callback_data=f"atop:{cid}"))
         kb.row(InlineKeyboardButton(text="🏁 Yakunlash", callback_data=f"fin:{cid}"))
     else:
         ws = await q_all("SELECT w.user_id, p.full_name FROM winners w LEFT JOIN participants p "
@@ -517,10 +621,103 @@ async def cb_detail(cb: CallbackQuery):
     await cb.answer()
 
 
+async def render_admin_top(cid):
+    scores = await get_scores(cid)
+    names = await part_names(cid)
+    ranked = sorted(scores.items(), key=lambda x: -total(x[1]))[:15]
+    kb = InlineKeyboardBuilder()
+    for uid, sc in ranked:
+        nm = (names.get(uid) or str(uid))[:16]
+        kb.row(
+            InlineKeyboardButton(text="➖", callback_data=f"adj:{cid}:{uid}:-1"),
+            InlineKeyboardButton(text=f"{nm}: {total(sc)}", callback_data=f"inf:{cid}:{uid}"),
+            InlineKeyboardButton(text="➕", callback_data=f"adj:{cid}:{uid}:1"),
+        )
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"c:{cid}"))
+    text = (
+        f"🏆 <b>Reyting #{cid}</b> (TOP 15)\n"
+        "➕/➖ — ballni 1 ga o'zgartirish, ism ustiga bosing — tafsilot.\n\n"
+        f"Istalgan odamga: <code>/ball {cid} @username +5</code> yoki <code>-3</code>\n"
+        f"Aniq natija qo'yish: <code>/set {cid} @username 10</code>\n"
+        "<i>Yakunlashda kanaldan chiqib ketganlar avtomatik olib tashlanadi.</i>"
+    )
+    return text, kb.as_markup()
+
+
 @admin_r.callback_query(F.data.startswith("atop:"))
 async def cb_atop(cb: CallbackQuery):
+    cid = int(cb.data.split(":")[1])
+    text, kb = await render_admin_top(cid)
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
-    await cb.message.answer(await top_text(int(cb.data.split(":")[1])))
+
+
+async def adjust_bonus(cid, uid, delta):
+    await q_exec("INSERT OR IGNORE INTO bonus VALUES(?,?,0)", (cid, uid))
+    await q_exec("UPDATE bonus SET value=value+? WHERE contest_id=? AND user_id=?", (delta, cid, uid))
+
+
+@admin_r.callback_query(F.data.startswith("adj:"))
+async def cb_adj(cb: CallbackQuery):
+    _, cid, uid, delta = cb.data.split(":")
+    await adjust_bonus(int(cid), int(uid), int(delta))
+    text, kb = await render_admin_top(int(cid))
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+    await cb.answer("Yangilandi")
+
+
+@admin_r.callback_query(F.data.startswith("inf:"))
+async def cb_inf(cb: CallbackQuery):
+    _, cid, uid = cb.data.split(":")
+    sc = (await get_scores(int(cid))).get(int(uid), {"inv": 0, "bonus": 0})
+    await cb.answer(f"Kanalga qo'shgan: {sc['inv']}\nAdmin balli: {sc['bonus']:+d}\nJami: {total(sc)}", show_alert=True)
+
+
+async def find_part(cid, ref):
+    ref = ref.strip().lstrip("@")
+    if ref.isdigit():
+        return await q_one("SELECT user_id, full_name FROM participants WHERE contest_id=? AND user_id=?", (cid, int(ref)))
+    row = await q_one("SELECT user_id, full_name FROM participants WHERE contest_id=? AND LOWER(username)=?",
+                      (cid, ref.lower()))
+    if row:
+        return row
+    rows = await q_all("SELECT user_id, full_name FROM participants WHERE contest_id=? AND LOWER(full_name) LIKE ?",
+                       (cid, f"%{ref.lower()}%"))
+    return rows[0] if len(rows) == 1 else None
+
+
+@admin_r.message(Command("ball"))
+async def cmd_ball(m: Message, command: CommandObject):
+    try:
+        cid_s, ref, delta_s = command.args.split()
+        cid, delta = int(cid_s), int(delta_s)
+    except Exception:
+        return await m.answer("Format: <code>/ball 1 @username +3</code> yoki <code>/ball 1 @username -2</code>")
+    p = await find_part(cid, ref)
+    if not p:
+        return await m.answer("❌ Bunday qatnashchi topilmadi (qatnashchi botdan «Qatnashish» bosgan bo'lishi kerak).")
+    await adjust_bonus(cid, p["user_id"], delta)
+    sc = (await get_scores(cid)).get(p["user_id"], {"inv": 0, "bonus": 0})
+    await m.answer(f"✅ {html.escape(p['full_name'] or '')}: jami <b>{total(sc)}</b> "
+                   f"(kanalga qo'shgan {sc['inv']}, admin balli {sc['bonus']:+d})")
+
+
+@admin_r.message(Command("set"))
+async def cmd_set(m: Message, command: CommandObject):
+    try:
+        cid_s, ref, val_s = command.args.split()
+        cid, val = int(cid_s), int(val_s)
+    except Exception:
+        return await m.answer("Format: <code>/set 1 @username 10</code>")
+    p = await find_part(cid, ref)
+    if not p:
+        return await m.answer("❌ Bunday qatnashchi topilmadi.")
+    sc = (await get_scores(cid)).get(p["user_id"], {"inv": 0, "bonus": 0})
+    await q_exec("INSERT OR REPLACE INTO bonus VALUES(?,?,?)", (cid, p["user_id"], val - sc["inv"]))
+    await m.answer(f"✅ {html.escape(p['full_name'] or '')} natijasi: <b>{val}</b>")
 
 
 async def show_pick(cb: CallbackQuery, cid: int, page: int):
@@ -620,6 +817,47 @@ async def cb_fok(cb: CallbackQuery):
     await cb.message.edit_text(res)
 
 
+# ───────────────────────── Zaxira (backup) ─────────────────────────
+@admin_r.message(Command("backup"))
+async def cmd_backup(m: Message):
+    if not os.path.exists(DB_PATH):
+        return await m.answer("Baza fayli topilmadi.")
+    await m.answer_document(FSInputFile(DB_PATH, filename="konkurs_backup.db"),
+                            caption="💾 Zaxira nusxa. Qaytarish uchun shu faylni <b>/restore</b> izohi bilan botga yuboring.")
+
+
+@admin_r.message(F.document, F.caption.startswith("/restore"))
+async def cmd_restore(m: Message):
+    tmp = DB_PATH + ".tmp"
+    await bot.download(m.document, destination=tmp)
+    with open(tmp, "rb") as f:
+        head = f.read(16)
+    if not head.startswith(b"SQLite format 3"):
+        os.remove(tmp)
+        return await m.answer("❌ Bu to'g'ri baza fayli emas.")
+    os.replace(tmp, DB_PATH)
+    await init_db()
+    n = (await q_one("SELECT COUNT(*) n FROM contests"))["n"]
+    await m.answer(f"✅ Baza tiklandi. Konkurslar soni: {n}. 📋 Konkurslarim ni tekshiring.")
+
+
+_last_backup = 0.0
+
+
+async def auto_backup():
+    global _last_backup
+    if not os.path.exists(DB_PATH):
+        return
+    if time.time() - _last_backup < 1800 or os.path.getmtime(DB_PATH) <= _last_backup:
+        return
+    n = (await q_one("SELECT COUNT(*) n FROM contests"))["n"]
+    if not n:
+        return
+    _last_backup = time.time()
+    await bot.send_document(ADMIN_ID, FSInputFile(DB_PATH, filename="konkurs_backup.db"),
+                            caption="💾 Avto-zaxira (oxirgisini saqlab qo'ying)", disable_notification=True)
+
+
 # ───────────────────────── Yakunlash ─────────────────────────
 async def finish_contest(cid: int) -> str:
     c = await get_contest(cid)
@@ -648,18 +886,16 @@ async def finish_contest(cid: int) -> str:
                 winners.append((uid, names.get(uid), ""))
             await asyncio.sleep(0.05)
 
-    else:  # referral: faqat hali ham obunada turgan taklif qilinganlar hisoblanadi
-        counts = {}
-        for p in parts:
-            if p["invited_by"]:
-                if await subscribed_all(p["user_id"], channels):
-                    counts[p["invited_by"]] = counts.get(p["invited_by"], 0) + 1
-                await asyncio.sleep(0.05)
-        for uid, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+    else:  # referral: kanalga havola orqali qo'shilganlar + admin ballari
+        scores = await get_scores(cid, verify=True)
+        ranked = sorted(scores.items(), key=lambda x: -total(x[1]))
+        for uid, sc in ranked:
             if len(winners) >= need:
                 break
-            if await subscribed_all(uid, channels):
-                winners.append((uid, names.get(uid), f" — {cnt} ta taklif"))
+            if total(sc) <= 0:
+                continue
+            if uid in names and await subscribed_all(uid, channels):
+                winners.append((uid, names.get(uid), f" — {total(sc)} ta"))
 
     await q_exec("DELETE FROM winners WHERE contest_id=?", (cid,))
     for uid, _, _ in winners:
@@ -707,6 +943,7 @@ async def scheduler():
                 else:
                     res = await finish_contest(r["id"])
                     await bot.send_message(ADMIN_ID, "⏰ Avto-yakunlandi:\n\n" + res)
+            await auto_backup()
         except Exception as e:
             log.exception("scheduler: %s", e)
         await asyncio.sleep(30)
@@ -732,8 +969,16 @@ async def main():
     dp.include_router(admin_r)
     await bot.delete_webhook(drop_pending_updates=True)
     await start_web()
+    if not (await q_one("SELECT COUNT(*) n FROM contests"))["n"]:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "⚠️ Baza bo'sh. Agar oldin konkurs bo'lgan bo'lsa (Render qayta ishga tushgan), oxirgi zaxira "
+                "faylni <b>/restore</b> izohi bilan shu yerga yuboring.")
+        except Exception:
+            pass
     asyncio.create_task(scheduler())
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
